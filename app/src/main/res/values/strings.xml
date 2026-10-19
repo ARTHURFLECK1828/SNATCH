@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Snatch</string>
+    <string name="snitch_accessibility_description">
+    Snatch checks app usage against limits you configure and displays a blocking screen when a limit is exceeded.</string>
+</resources>
