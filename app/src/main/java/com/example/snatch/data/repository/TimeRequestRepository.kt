@@ -72,66 +72,54 @@ class TimeRequestRepository(
             ?: currentUser.email?.substringBefore("@")
             ?: "User_${uid.take(5)}"
 
-        // Try trusted Cloud Function backend first
         return try {
-            val data = hashMapOf(
-                "requestId" to requestId,
-                "approve" to approve
-            )
-            functions.getHttpsCallable("voteOnRequest").call(data).await()
-            Result.success(Unit)
-        } catch (functionException: Exception) {
-            // Fallback for direct Firestore write if Cloud Functions are not yet deployed in current environment
-            try {
-                val reqDocRef = firestore.collection("groups").document("main")
-                    .collection("timeRequests").document(requestId)
-                val reqDoc = reqDocRef.get().await()
+            val reqDocRef = firestore.collection("groups").document("main")
+                .collection("timeRequests").document(requestId)
 
+            firestore.runTransaction { transaction ->
+                val reqDoc = transaction.get(reqDocRef)
                 val timeRequest = reqDoc.toObject(TimeRequest::class.java)
-                    ?: return Result.failure(IllegalStateException("Time request not found"))
+                    ?: throw IllegalStateException("Time request not found")
 
                 if (timeRequest.requesterUid == uid) {
-                    return Result.failure(IllegalArgumentException("You cannot vote on your own request"))
+                    throw IllegalArgumentException("You cannot vote on your own request")
                 }
 
                 if (timeRequest.status != "pending") {
-                    return Result.failure(IllegalStateException("This request is already resolved (${timeRequest.status})"))
+                    throw IllegalStateException("This request is already ${timeRequest.status}")
                 }
 
                 val voteDocRef = reqDocRef.collection("votes").document(uid)
-                val existingVote = voteDocRef.get().await()
-                if (existingVote.exists()) {
-                    return Result.failure(IllegalStateException("You have already voted on this request"))
-                }
-
                 val vote = RequestVote(
                     uid = uid,
                     voterName = voterName,
                     approved = approve,
                     votedAt = System.currentTimeMillis()
                 )
+                transaction.set(voteDocRef, vote)
 
-                voteDocRef.set(vote).await()
+                val newApproveCount = timeRequest.approveVotesCount + (if (approve) 1 else 0)
+                val newRejectCount = timeRequest.rejectVotesCount + (if (!approve) 1 else 0)
 
-                // Evaluate vote counts & threshold client-side (works 100% FREE on Spark plan)
-                val allVotesSnap = reqDocRef.collection("votes").get().await()
-                val votes = allVotesSnap.documents.mapNotNull { it.toObject(RequestVote::class.java) }
-                val approveCount = votes.count { it.approved }
-                val rejectCount = votes.count { !it.approved }
+                val newStatus = when {
+                    newApproveCount >= 1 -> "approved"
+                    newRejectCount >= 1 -> "rejected"
+                    else -> "pending"
+                }
 
-                val membersSnap = firestore.collection("groups").document("main")
-                    .collection("members").get().await()
-                val totalMembers = membersSnap.size()
-                val eligibleVoters = (totalMembers - 1).coerceAtLeast(1)
-
-                val updates = hashMapOf<String, Any>(
-                    "approveVotesCount" to approveCount,
-                    "rejectVotesCount" to rejectCount
+                transaction.update(
+                    reqDocRef,
+                    mapOf(
+                        "approveVotesCount" to newApproveCount,
+                        "rejectVotesCount" to newRejectCount,
+                        "status" to newStatus
+                    )
                 )
 
-                if (approveCount >= 1 && approveCount >= (eligibleVoters + 1) / 2) {
-                    updates["status"] = "approved"
+                if (newStatus == "approved") {
                     val grantId = UUID.randomUUID().toString()
+                    val grantRef = firestore.collection("groups").document("main")
+                        .collection("grants").document(grantId)
                     val grant = TimeGrant(
                         grantId = grantId,
                         requestId = requestId,
@@ -140,18 +128,13 @@ class TimeRequestRepository(
                         minutes = timeRequest.requestedMinutes,
                         issuedAt = System.currentTimeMillis()
                     )
-                    firestore.collection("groups").document("main")
-                        .collection("grants").document(grantId)
-                        .set(grant).await()
-                } else if (rejectCount >= (eligibleVoters + 1) / 2) {
-                    updates["status"] = "rejected"
+                    transaction.set(grantRef, grant)
                 }
+            }.await()
 
-                reqDocRef.update(updates).await()
-                Result.success(Unit)
-            } catch (e: Exception) {
-                Result.failure(e)
-            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
         }
     }
 
@@ -166,6 +149,40 @@ class TimeRequestRepository(
                 val requests = snapshot?.documents?.mapNotNull {
                     it.toObject(TimeRequest::class.java)
                 }?.sortedByDescending { it.createdAt } ?: emptyList()
+                trySend(requests)
+            }
+        awaitClose { listener.remove() }
+    }
+
+    fun observeTimeRequestsWithNotifications(context: Context, currentUid: String): Flow<List<TimeRequest>> = callbackFlow {
+        val notifiedRequestIds = mutableSetOf<String>()
+        val listener = firestore.collection("groups").document("main")
+            .collection("timeRequests")
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    close(error)
+                    return@addSnapshotListener
+                }
+                val requests = snapshot?.documents?.mapNotNull {
+                    it.toObject(TimeRequest::class.java)
+                }?.sortedByDescending { it.createdAt } ?: emptyList()
+
+                // Trigger notification for new requests from other members
+                for (req in requests) {
+                    if (req.requesterUid.isNotBlank() && req.requesterUid != currentUid && req.status == "pending") {
+                        if (!notifiedRequestIds.contains(req.requestId)) {
+                            notifiedRequestIds.add(req.requestId)
+                            if (req.createdAt > System.currentTimeMillis() - 300_000L) {
+                                com.example.snatch.fcm.NotificationHelper.showNotification(
+                                    context = context,
+                                    title = "Extra-Time Request Received! ⏳",
+                                    message = "${req.requesterName} requested +${req.requestedMinutes} min for ${req.appName}. Tap to vote!"
+                                )
+                            }
+                        }
+                    }
+                }
+
                 trySend(requests)
             }
         awaitClose { listener.remove() }

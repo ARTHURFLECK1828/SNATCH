@@ -129,6 +129,37 @@ exports.onVoteWritten = onDocumentCreated(
 );
 
 /**
+ * Firestore Trigger: sends push notification when a new time request is created
+ */
+exports.onRequestCreated = onDocumentCreated(
+  "groups/main/timeRequests/{requestId}",
+  async (event) => {
+    const requestData = event.data.data();
+    if (!requestData) return;
+
+    const payload = {
+      notification: {
+        title: "Extra-Time Request Received! ⏳",
+        body: `${requestData.requesterName} requested +${requestData.requestedMinutes} mins for ${requestData.appName}. Tap to vote!`
+      },
+      data: {
+        requestId: event.params.requestId,
+        requesterUid: requestData.requesterUid,
+        packageName: requestData.packageName,
+        type: "time_request"
+      },
+      topic: "snitch_group_main"
+    };
+
+    try {
+      await admin.messaging().send(payload);
+    } catch (error) {
+      console.error("Error sending FCM notification:", error);
+    }
+  }
+);
+
+/**
  * Helper function to count votes and issue grants securely
  */
 async function evaluateVotingThreshold(requestId) {

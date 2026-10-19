@@ -50,6 +50,9 @@ import com.example.snatch.data.repository.TimeRequestRepository
 import com.example.snatch.ui.AuthScreen
 import com.example.snatch.ui.GroupSection
 import com.example.snatch.ui.TimeRequestsSection
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import java.text.DateFormat
 import java.util.Calendar
 import java.util.Date
@@ -67,6 +70,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.example.snatch.fcm.NotificationHelper.createNotificationChannel(this)
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
+            }
+        }
+
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
@@ -101,10 +112,28 @@ fun MainAppScreen(
     var selectedTabIndex by remember { mutableIntStateOf(0) }
     val tabs = listOf("Usage & Limits", "Friend Group", "Time Requests")
 
-    // Sync grants in realtime whenever signed in
+    // Sync grants and notifications in realtime whenever signed in
     LaunchedEffect(currentUser?.uid) {
         currentUser?.uid?.let { uid ->
-            timeRequestRepository.observeUserGrantsAndSync(context, uid).collect {}
+            // Subscribe to group FCM topic and save token
+            try {
+                com.google.firebase.messaging.FirebaseMessaging.getInstance()
+                    .subscribeToTopic("snitch_group_main").await()
+                val token = com.google.firebase.messaging.FirebaseMessaging.getInstance().token.await()
+                val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+                db.collection("users").document(uid).update("fcmToken", token)
+                db.collection("groups").document("main").collection("members").document(uid).update("fcmToken", token)
+            } catch (_: Exception) {}
+
+            coroutineScope {
+                launch {
+                    timeRequestRepository.observeUserGrantsAndSync(context, uid).collect {}
+                }
+
+                launch {
+                    timeRequestRepository.observeTimeRequestsWithNotifications(context, uid).collect {}
+                }
+            }
         }
     }
 
