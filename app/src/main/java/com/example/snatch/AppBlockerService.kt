@@ -54,7 +54,7 @@ class AppBlockerService : AccessibilityService() {
             return
         }
 
-        val limitMinutes = LimitStore.getLimitMinutes(this, pkg)
+        val limitMinutes = TimeExtensionStore.getEffectiveLimitMinutes(this, pkg)
         if (limitMinutes == null) {
             hideOverlay()
             return

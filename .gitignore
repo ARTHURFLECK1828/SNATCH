@@ -1,15 +1,50 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/DALVIK VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
 /build
+/*/build
+.gradle
+.kotlin
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Android Studio / IntelliJ project files
+*.iml
+.idea/caches
+.idea/libraries
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.idea/deploymentTargetSelector.xml
+.idea/shelf
+.DS_Store
+
+# Sensitive Firebase & credentials files
+app/google-services.json
+google-services.json
+*.jks
+*.keystore
+
+# Node.js / Cloud Functions
+functions/node_modules/
+npm-debug.log
+firebase-debug.log
+firebase-debug.*.log
+
+# Artifacts & Captures
+.artifacts/
 /captures
 .externalNativeBuild
 .cxx
-local.properties

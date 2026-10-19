@@ -1,4 +1,3 @@
-
 package com.example.snatch
 
 import android.app.AppOpsManager
@@ -25,14 +24,32 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.example.snatch.data.repository.AuthRepository
+import com.example.snatch.data.repository.GroupRepository
+import com.example.snatch.data.repository.TimeRequestRepository
+import com.example.snatch.ui.AuthScreen
+import com.example.snatch.ui.GroupSection
+import com.example.snatch.ui.TimeRequestsSection
 import java.text.DateFormat
 import java.util.Calendar
 import java.util.Date
@@ -44,39 +61,132 @@ data class AppUsage(
 )
 
 class MainActivity : ComponentActivity() {
+    private val authRepository by lazy { AuthRepository() }
+    private val groupRepository by lazy { GroupRepository() }
+    private val timeRequestRepository by lazy { TimeRequestRepository() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
-                    UsageScreen()
+                    val currentUser by authRepository.currentUser.collectAsState()
+                    val userProfile by authRepository.userProfile.collectAsState()
+
+                    if (currentUser == null) {
+                        AuthScreen(authRepository = authRepository)
+                    } else {
+                        MainAppScreen(
+                            authRepository = authRepository,
+                            groupRepository = groupRepository,
+                            timeRequestRepository = timeRequestRepository
+                        )
+                    }
                 }
             }
         }
     }
+}
 
-    override fun onResume() {
-        super.onResume()
-        // UsageScreen refreshes when it resumes via lifecycle below.
+@Composable
+fun MainAppScreen(
+    authRepository: AuthRepository,
+    groupRepository: GroupRepository,
+    timeRequestRepository: TimeRequestRepository
+) {
+    val context = LocalContext.current
+    val currentUser by authRepository.currentUser.collectAsState()
+    val userProfile by authRepository.userProfile.collectAsState()
+
+    var selectedTabIndex by remember { mutableIntStateOf(0) }
+    val tabs = listOf("Usage & Limits", "Friend Group", "Time Requests")
+
+    // Sync grants in realtime whenever signed in
+    LaunchedEffect(currentUser?.uid) {
+        currentUser?.uid?.let { uid ->
+            timeRequestRepository.observeUserGrantsAndSync(context, uid).collect {}
+        }
+    }
+
+    var usageList by remember { mutableStateOf(emptyList<AppUsage>()) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        // Top Header
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = userProfile?.displayName?.ifBlank { null }
+                            ?: currentUser?.email
+                            ?: "User",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = currentUser?.email ?: "",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
+                OutlinedButton(onClick = { authRepository.signOut() }) {
+                    Text("Sign Out")
+                }
+            }
+        }
+
+        ScrollableTabRow(selectedTabIndex = selectedTabIndex) {
+            tabs.forEachIndexed { index, title ->
+                Tab(
+                    selected = selectedTabIndex == index,
+                    onClick = { selectedTabIndex = index },
+                    text = { Text(title) }
+                )
+            }
+        }
+
+        when (selectedTabIndex) {
+            0 -> UsageAndLimitsTab(onUsageUpdated = { usageList = it })
+            1 -> GroupSection(userProfile = userProfile, groupRepository = groupRepository)
+            2 -> TimeRequestsSection(
+                userProfile = userProfile,
+                installedApps = usageList,
+                timeRequestRepository = timeRequestRepository
+            )
+        }
     }
 }
 
 @Composable
-fun UsageScreen() {
-    val context = androidx.compose.ui.platform.LocalContext.current
+fun UsageAndLimitsTab(
+    onUsageUpdated: (List<AppUsage>) -> Unit
+) {
+    val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 
     var hasAccess by remember { mutableStateOf(hasUsageAccess(context)) }
     var usage by remember { mutableStateOf(emptyList<AppUsage>()) }
-    var limits by remember { mutableStateOf(LimitStore.allLimits(context)) }
+    var baseLimits by remember { mutableStateOf(LimitStore.allLimits(context)) }
+    var extraMinutesMap by remember { mutableStateOf(TimeExtensionStore.allExtraMinutes(context)) }
     var error by remember { mutableStateOf<String?>(null) }
 
     fun refresh() {
         hasAccess = hasUsageAccess(context)
-        limits = LimitStore.allLimits(context)
+        baseLimits = LimitStore.allLimits(context)
+        extraMinutesMap = TimeExtensionStore.allExtraMinutes(context)
         if (hasAccess) {
             try {
                 usage = readTodayUsage(context)
+                onUsageUpdated(usage)
                 error = null
             } catch (e: Exception) {
                 error = e.message ?: "Unable to read usage statistics."
@@ -94,51 +204,47 @@ fun UsageScreen() {
 
     LaunchedEffect(Unit) { refresh() }
 
-    val exceeded = usage.count { app ->
-        val limit = limits[app.packageName]
-        limit != null && app.foregroundMillis >= limit * 60_000L
+    val exceededCount = usage.count { app ->
+        val effectiveLimit = TimeExtensionStore.getEffectiveLimitMinutes(context, app.packageName)
+        effectiveLimit != null && app.foregroundMillis >= effectiveLimit * 60_000L
     }
 
     Column(
-        Modifier.fillMaxSize().padding(16.dp),
+        modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Text("Snitch", style = MaterialTheme.typography.headlineLarge)
-        Text(
-            "Today: ${DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date())}"
-        )
-        Text("Limits exceeded: $exceeded")
+        Text("Today: ${DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date())}")
+        Text("Limits exceeded: $exceededCount")
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { refresh() }) { Text("Refresh") }
             Button(onClick = {
-                context.startActivity(
-                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
-                )
-            }) { Text("Usage access") }
+                context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+            }) { Text("Usage Access") }
         }
 
         Button(onClick = {
-            context.startActivity(
-                Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-            )
+            context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }) {
-            Text("Blocking service settings")
+            Text("Blocking Service Settings")
         }
 
-        error?.let { Text("Error: $it") }
+        error?.let { Text("Error: $it", color = MaterialTheme.colorScheme.error) }
 
         if (!hasAccess) {
             Text("Enable Usage Access to calculate daily limits.")
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(usage, key = { it.packageName }) { app ->
-                    val limit = limits[app.packageName]
-                    val usedMinutes = app.foregroundMillis / 60_000L
-                    val isExceeded = limit != null &&
-                            app.foregroundMillis >= limit * 60_000L
-                    var input by remember(app.packageName, limit) {
-                        mutableStateOf(limit?.toString() ?: "")
+                    val baseLimit = baseLimits[app.packageName]
+                    val extraMins = TimeExtensionStore.getExtraMinutes(context, app.packageName)
+                    val effectiveLimit = if (baseLimit != null) baseLimit + extraMins else null
+
+                    val isExceeded = effectiveLimit != null &&
+                            app.foregroundMillis >= effectiveLimit * 60_000L
+
+                    var input by remember(app.packageName, baseLimit) {
+                        mutableStateOf(baseLimit?.toString() ?: "")
                     }
 
                     Card(Modifier.fillMaxWidth()) {
@@ -153,20 +259,27 @@ fun UsageScreen() {
                             Text("Used today: ${formatDuration(app.foregroundMillis)}")
                             Text("Package: ${app.packageName}")
 
-                            if (limit != null) {
+                            if (baseLimit != null) {
+                                val limitText = if (extraMins > 0) {
+                                    "Base limit: ${baseLimit}m + Extra: ${extraMins}m = Effective: ${effectiveLimit}m"
+                                } else {
+                                    "Daily Limit: ${baseLimit} min"
+                                }
+
                                 Text(
-                                    if (isExceeded) "LIMIT EXCEEDED"
-                                    else "Limit: ${limit} min"
+                                    if (isExceeded) "LIMIT EXCEEDED ($limitText)"
+                                    else limitText
                                 )
                                 LinearProgressIndicator(
                                     progress = {
+                                        val totalLimit = effectiveLimit ?: baseLimit
                                         (app.foregroundMillis.toFloat() /
-                                                (limit * 60_000f)).coerceIn(0f, 1f)
+                                                (totalLimit * 60_000f)).coerceIn(0f, 1f)
                                     },
                                     modifier = Modifier.fillMaxWidth()
                                 )
                             } else {
-                                Text("No daily limit set")
+                                Text("No base limit set")
                             }
 
                             Row(
@@ -176,34 +289,29 @@ fun UsageScreen() {
                                 OutlinedTextField(
                                     value = input,
                                     onValueChange = { value ->
-                                        if (value.length <= 4 &&
-                                            value.all { it.isDigit() }) {
+                                        if (value.length <= 4 && value.all { it.isDigit() }) {
                                             input = value
                                         }
                                     },
-                                    label = { Text("Minutes/day") },
+                                    label = { Text("Base Minutes/day") },
                                     singleLine = true,
-                                    keyboardOptions = KeyboardOptions(
-                                        keyboardType = KeyboardType.Number
-                                    ),
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                     modifier = Modifier.weight(1f)
                                 )
                                 Button(onClick = {
                                     val minutes = input.toIntOrNull()
                                     if (minutes != null && minutes in 1..1440) {
-                                        LimitStore.setLimitMinutes(
-                                            context, app.packageName, minutes
-                                        )
-                                        limits = LimitStore.allLimits(context)
+                                        LimitStore.setLimitMinutes(context, app.packageName, minutes)
+                                        refresh()
                                     }
                                 }) { Text("Save") }
                             }
 
-                            if (limit != null) {
+                            if (baseLimit != null) {
                                 Button(onClick = {
                                     LimitStore.removeLimit(context, app.packageName)
-                                    limits = LimitStore.allLimits(context)
-                                }) { Text("Remove limit") }
+                                    refresh()
+                                }) { Text("Remove Limit") }
                             }
                         }
                     }
@@ -214,8 +322,7 @@ fun UsageScreen() {
 }
 
 fun hasUsageAccess(context: Context): Boolean {
-    val appOps = context.getSystemService(Context.APP_OPS_SERVICE)
-            as AppOpsManager
+    val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
     return appOps.checkOpNoThrow(
         AppOpsManager.OPSTR_GET_USAGE_STATS,
         Process.myUid(),
@@ -224,8 +331,7 @@ fun hasUsageAccess(context: Context): Boolean {
 }
 
 fun readTodayUsage(context: Context): List<AppUsage> {
-    val manager = context.getSystemService(Context.USAGE_STATS_SERVICE)
-            as UsageStatsManager
+    val manager = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
     val now = System.currentTimeMillis()
     val calendar = Calendar.getInstance().apply {
         timeInMillis = now
@@ -246,8 +352,9 @@ fun readTodayUsage(context: Context): List<AppUsage> {
 
     val labels = context.packageManager
         .queryIntentActivities(launcherIntent, 0)
-        .associate { it.activityInfo.packageName to
-                it.loadLabel(context.packageManager).toString() }
+        .associate {
+            it.activityInfo.packageName to it.loadLabel(context.packageManager).toString()
+        }
 
     return stats.asSequence()
         .filter { it.totalTimeInForeground > 0L }

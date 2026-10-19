@@ -1,0 +1,73 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUser(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    function isMemberOfGroup(groupId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+    }
+
+    // User profile rules
+    match /users/{uid} {
+      allow read: if isAuthenticated();
+      allow create, update: if isUser(uid);
+      allow delete: if false;
+    }
+
+    // Single Shared Group rules (groupId = "main")
+    match /groups/main {
+      // Group metadata read/create allowed for authenticated users
+      allow read, create: if isAuthenticated();
+      allow update, delete: if false;
+
+      // Group Members
+      match /members/{memberUid} {
+        allow read: if isAuthenticated();
+        allow create: if isUser(memberUid);
+        allow update, delete: if false;
+      }
+
+      // Time Extension Requests
+      match /timeRequests/{requestId} {
+        allow read: if isAuthenticated();
+
+        // Members can create a pending request for themselves
+        allow create: if isAuthenticated() &&
+          request.resource.data.requesterUid == request.auth.uid &&
+          request.resource.data.status == "pending" &&
+          request.resource.data.requestedMinutes > 0 &&
+          request.resource.data.requestedMinutes <= 240;
+
+        // Group members can update vote counts and status when voting
+        allow update: if isAuthenticated();
+        allow delete: if false;
+
+        // Member Votes on Time Request
+        match /votes/{voterUid} {
+          allow read: if isAuthenticated();
+
+          // Must be the voter themselves, must NOT be the requester
+          allow create: if isUser(voterUid) &&
+            request.auth.uid != get(/databases/$(database)/documents/groups/main/timeRequests/$(requestId)).data.requesterUid;
+
+          allow update, delete: if false; // One vote per member
+        }
+      }
+
+      // Approved Grants
+      match /grants/{grantId} {
+        allow read: if isAuthenticated();
+        allow create: if isAuthenticated();
+        allow update, delete: if false;
+      }
+    }
+  }
+}
